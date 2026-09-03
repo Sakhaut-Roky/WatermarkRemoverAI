@@ -1,0 +1,62 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+venv/
+.venv/
+env/
+ENV/
+
+# Model checkpoints & weights (store large files in remote registry or Git LFS)
+*.pt
+*.pth
+*.onnx
+*.safetensors
+*.bin
+weights/
+checkpoints/
+
+# Data & outputs
+storage/
+data/
+uploads/
+outputs/
+flagged/
+
+# Logs
+*.log
+logs/
+
+# Environment variables
+.env
+.env.local
+
+# IDE & editors
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store

@@ -1,0 +1,26 @@
+# ==============================================================================
+# WatermarkRemoverAI - Enterprise Dependencies
+# ==============================================================================
+
+# API & Web Framework
+fastapi>=0.110.0
+uvicorn[standard]>=0.28.0
+python-multipart>=0.0.9
+aiofiles>=23.2.1
+pydantic>=2.6.0
+pydantic-settings>=2.2.0
+
+# Deep Learning & Computer Vision Core
+torch>=2.2.0
+torchvision>=0.17.0
+opencv-python>=4.9.0.80
+numpy>=1.26.0,<2.0.0
+Pillow>=10.2.0
+
+# Interactive UI & Prototyping
+gradio>=4.20.0
+
+# Enterprise Utilities, Configuration & Logging
+python-dotenv>=1.0.1
+loguru>=0.7.2
+httpx>=0.27.0
