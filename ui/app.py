@@ -8,11 +8,19 @@ Dual-pane enterprise Gradio application featuring:
 """
 
 import os
+import sys
 import io
 import json
 import base64
 import logging
+from pathlib import Path
 from typing import Optional, Tuple, Dict, Any
+
+# Ensure project root directory is in sys.path for standalone executions
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
 import numpy as np
 from PIL import Image
 import gradio as gr
@@ -62,7 +70,7 @@ def extract_mask_from_editor(editor_data: Any) -> Tuple[Optional[Image.Image], O
     if editor_data is None:
         return None, None
 
-    # Gradio 4.x ImageEditor returns a dictionary:
+    # Gradio 4.x/6.x ImageEditor returns a dictionary:
     # {'background': PIL.Image, 'layers': [PIL.Image, ...], 'composite': PIL.Image}
     if isinstance(editor_data, dict):
         bg = editor_data.get("background")
@@ -180,19 +188,7 @@ def build_ui() -> gr.Blocks:
     """
     Builds the enterprise-grade dual-pane QA interface using Gradio Blocks.
     """
-    custom_theme = gr.themes.Soft(
-        primary_hue="blue",
-        secondary_hue="slate",
-        neutral_hue="slate"
-    )
-
-    custom_css = """
-    .gradio-container { max-width: 1350px !important; margin: 0 auto; }
-    .header-box { text-align: center; padding: 20px 0 10px 0; }
-    .status-box { border-radius: 8px; font-size: 0.95rem; }
-    """
-
-    with gr.Blocks(title="WatermarkRemoverAI - Enterprise QA", theme=custom_theme, css=custom_css) as demo:
+    with gr.Blocks(title="WatermarkRemoverAI - Enterprise QA") as demo:
         with gr.Row(elem_classes=["header-box"]):
             gr.Markdown(
                 """
@@ -288,4 +284,10 @@ def build_ui() -> gr.Blocks:
 
 if __name__ == "__main__":
     ui = build_ui()
-    ui.launch(server_name="127.0.0.1", server_port=7860, share=False)
+    ui.launch(
+        server_name="127.0.0.1",
+        server_port=7860,
+        share=False,
+        theme=gr.themes.Soft(primary_hue="blue", secondary_hue="slate", neutral_hue="slate"),
+        css=".gradio-container { max-width: 1350px !important; margin: 0 auto; } .header-box { text-align: center; padding: 20px 0 10px 0; } .status-box { border-radius: 8px; font-size: 0.95rem; }"
+    )

@@ -69,6 +69,7 @@ else
 fi
 
 # 5. Service Orchestration
+export PYTHONPATH="$SCRIPT_DIR:$PYTHONPATH"
 echo "------------------------------------------------------------------"
 echo "[*] Launching WatermarkRemoverAI Microservices..."
 
