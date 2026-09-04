@@ -8,12 +8,15 @@ Provides asynchronous, high-concurrency endpoints:
 - GET  /api/v1/result/{job_id}: Streams cleaned image or returns processing metadata.
 - GET  /api/v1/status/{job_id}: Returns job lifecycle state and diagnostics.
 - GET  /api/v1/health: Service health probe.
+- POST /api/v1/process_video: Asynchronously removes watermarks from MP4 videos.
 """
 
 import os
 import time
 import uuid
 import json
+import shutil
+import logging
 import base64
 import asyncio
 from pathlib import Path
@@ -36,9 +39,15 @@ except ImportError:
 from core.config import settings
 from core.mask_generator import WatermarkDetector
 from core.inpaint_engine import InpaintingLaMa
+from core.video_processor import VideoWatermarkRemover
+
+logger = logging.getLogger("WatermarkRemoverAI.API")
 
 # Router instantiation
 router = APIRouter(tags=["Watermark Removal Pipeline"])
+
+# Maximum concurrent video processing pipelines to avoid GPU/CPU exhaustion
+VIDEO_CONCURRENCY_SEMAPHORE = asyncio.Semaphore(2)
 
 # Storage configuration
 STORAGE_ROOT = Path(settings.STORAGE_DIR)
@@ -151,6 +160,12 @@ class InferenceService:
     def __init__(self):
         self.detector = WatermarkDetector(auto_fallback=True)
         self.inpainter = InpaintingLaMa()
+        self.video_remover = VideoWatermarkRemover(
+            detector=self.detector,
+            inpainter=self.inpainter,
+            device=str(self.inpainter.device),
+            max_duration_seconds=10.0,
+        )
 
     @classmethod
     def get_instance(cls) -> "InferenceService":
@@ -291,6 +306,71 @@ def execute_watermark_removal(job_id: str, request: ProcessRequest) -> Dict[str,
     return metadata
 
 
+def execute_video_watermark_removal(
+    job_id: str,
+    input_path: Path,
+    output_path: Path,
+    temp_frames_dir: Path,
+    static_mask: bool = False,
+    composite: bool = True,
+    max_duration: float = 10.0,
+) -> Dict[str, Any]:
+    """
+    Synchronous worker for video watermark removal pipeline.
+    Executes frame-by-frame extraction, watermark detection, neural LaMa inpainting,
+    and MoviePy video/audio reassembly within the threadpool.
+    Guarantees deletion of all intermediate extracted frame files upon completion or failure.
+    """
+    service = get_service()
+    job_dir = get_job_dir(job_id)
+    metadata = read_metadata(job_dir)
+    metadata["status"] = "processing"
+    write_metadata(job_dir, metadata)
+
+    try:
+        remover = VideoWatermarkRemover(
+            detector=service.detector,
+            inpainter=service.inpainter,
+            device=str(service.inpainter.device),
+            max_duration_seconds=max_duration,
+            temp_dir=temp_frames_dir,
+        )
+
+        result = remover.process_video(
+            video_path=input_path,
+            output_path=output_path,
+            static_mask=static_mask,
+            composite=composite,
+        )
+
+        metadata.update({
+            "job_id": job_id,
+            "status": "completed",
+            "duration_seconds": result.get("elapsed_time_seconds", 0.0),
+            "result_file": str(output_path.name),
+            "diagnostics": result,
+            "completed_at": datetime.utcnow().isoformat(),
+        })
+        write_metadata(job_dir, metadata)
+        return result
+
+    except Exception as exc:
+        logger.error("Video watermark removal failed for job %s: %s", job_id, exc, exc_info=True)
+        metadata["status"] = "failed"
+        metadata["error"] = str(exc)
+        write_metadata(job_dir, metadata)
+        raise exc
+
+    finally:
+        # Enforce strict deletion of intermediate frame files to prevent disk exhaustion
+        if temp_frames_dir.exists():
+            try:
+                shutil.rmtree(temp_frames_dir, ignore_errors=True)
+                logger.debug("Successfully cleaned up intermediate frame directory: %s", temp_frames_dir)
+            except Exception as clean_err:
+                logger.warning("Failed to clean up intermediate frame directory %s: %s", temp_frames_dir, clean_err)
+
+
 # ------------------------------------------------------------------------------
 # Endpoints
 # ------------------------------------------------------------------------------
@@ -405,6 +485,121 @@ async def process_image(request: ProcessRequest):
         )
 
 
+@router.post(
+    "/process_video",
+    summary="Asynchronously process and remove watermarks from an MP4 video",
+    status_code=status.HTTP_200_OK,
+    response_class=FileResponse,
+)
+async def process_video(
+    file: UploadFile = File(..., description="Uploaded MP4 video file"),
+    static_mask: bool = Query(False, description="Whether to reuse detected watermark mask across all frames for maximum speed"),
+    composite: bool = Query(True, description="Preserve unmasked background pixels byte-for-byte"),
+    max_duration: float = Query(10.0, ge=0.5, le=10.0, description="Maximum video duration to process in seconds (capped at 10.0s)"),
+):
+    """
+    High-performance asynchronous video watermark removal endpoint:
+    - Accepts an MP4 video file upload.
+    - Saves it into a temporary UUID-categorized directory.
+    - Leverages async threadpool and concurrency semaphores to gracefully handle concurrent requests.
+    - Sequentially extracts and processes frames using WatermarkDetector and InpaintingLaMa.
+    - Reassembles cleaned frames with original synchronized audio track via MoviePy.
+    - Strictly deletes all intermediate frame files after processing to conserve disk space.
+    - Returns the cleaned video directly as a FileResponse.
+    """
+    # 1. Validate file format
+    original_filename = file.filename or "input.mp4"
+    if not original_filename.lower().endswith(".mp4"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Unsupported media format for '{original_filename}'. Only .mp4 video files are accepted."
+        )
+
+    # 2. Allocate isolated UUID workspace
+    job_id = str(uuid.uuid4())
+    job_dir = get_job_dir(job_id)
+    job_dir.mkdir(parents=True, exist_ok=True)
+
+    input_video_path = job_dir / "input.mp4"
+    output_video_path = job_dir / "cleaned.mp4"
+    temp_frames_dir = job_dir / "frames"
+    temp_frames_dir.mkdir(parents=True, exist_ok=True)
+
+    now_iso = datetime.utcnow().isoformat()
+    write_metadata(job_dir, {
+        "job_id": job_id,
+        "original_filename": original_filename,
+        "saved_filename": "input.mp4",
+        "result_file": "cleaned.mp4",
+        "status": "uploading",
+        "media_type": "video/mp4",
+        "created_at": now_iso,
+    })
+
+    try:
+        # 3. Stream upload asynchronously to disk
+        bytes_written = await write_file_async(input_video_path, file)
+        if bytes_written == 0:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Uploaded video file is empty (0 bytes)."
+            )
+
+        # 4. Handle concurrent requests via concurrency semaphore & async threadpool
+        async with VIDEO_CONCURRENCY_SEMAPHORE:
+            result = await asyncio.to_thread(
+                execute_video_watermark_removal,
+                job_id=job_id,
+                input_path=input_video_path,
+                output_path=output_video_path,
+                temp_frames_dir=temp_frames_dir,
+                static_mask=static_mask,
+                composite=composite,
+                max_duration=max_duration,
+            )
+
+        # 5. Verify output video exists
+        if not output_video_path.is_file() or output_video_path.stat().st_size == 0:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Cleaned video generation failed or produced an empty file."
+            )
+
+        # 6. Stream cleaned video back to client
+        download_filename = f"cleaned_{Path(original_filename).name}"
+        headers = {
+            "Content-Disposition": f'attachment; filename="{download_filename}"',
+            "X-Job-ID": job_id,
+            "X-Processing-Time-Seconds": str(result.get("elapsed_time_seconds", 0.0)),
+            "X-Frames-Processed": str(result.get("total_frames_processed", 0)),
+            "X-Original-Duration": str(result.get("original_duration_seconds", 0.0)),
+            "X-Processed-Duration": str(result.get("processed_duration_seconds", 0.0)),
+            "X-Audio-Preserved": str(result.get("audio_preserved", False)),
+        }
+
+        return FileResponse(
+            path=str(output_video_path),
+            media_type="video/mp4",
+            filename=download_filename,
+            headers=headers,
+        )
+
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Video watermark removal pipeline failed: {str(exc)}"
+        )
+    finally:
+        # Guarantee intermediate frames cleanup
+        if temp_frames_dir.exists():
+            try:
+                shutil.rmtree(temp_frames_dir, ignore_errors=True)
+            except Exception:
+                pass
+
+
 @router.get(
     "/result/{job_id}",
     summary="Retrieve cleaned result image or intermediate mask"
@@ -414,7 +609,7 @@ async def get_result(
     artifact: str = Query("cleaned", enum=["cleaned", "mask", "original"]),
     download: bool = Query(False, description="Force browser download")
 ):
-    """Streams requested image artifact (cleaned image, binary mask, or original source)."""
+    """Streams requested image or video artifact (cleaned asset, binary mask, or original source)."""
     job_dir = get_job_dir(job_id)
     if not job_dir.is_dir():
         raise HTTPException(
@@ -449,12 +644,15 @@ async def get_result(
             detail=f"Artifact '{artifact}' not found for job '{job_id}'."
         )
 
-    filename = f"{artifact}_{job_id}.png"
-    headers = {"Content-Disposition": f"attachment; filename={filename}"} if download else None
+    is_video = target_path.suffix.lower() == ".mp4"
+    media_type = "video/mp4" if is_video else "image/png"
+    ext = ".mp4" if is_video else ".png"
+    filename = f"{artifact}_{job_id}{ext}"
+    headers = {"Content-Disposition": f'attachment; filename="{filename}"'} if download else None
 
     return FileResponse(
-        path=target_path,
-        media_type="image/png",
+        path=str(target_path),
+        media_type=media_type,
         filename=filename if download else None,
         headers=headers
     )
