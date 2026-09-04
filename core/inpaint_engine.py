@@ -98,6 +98,148 @@ def unpad_tensor(tensor: torch.Tensor, pad_coords: Tuple[int, int, int, int], or
     return tensor[:, :, :orig_h, :orig_w]
 
 
+def generate_bbox_mask(
+    height: int,
+    width: int,
+    bbox: Union[Tuple[int, int, int, int], Any]
+) -> np.ndarray:
+    """
+    Programmatically generates a single-channel pure black mask (zeros) with a
+    pure white rectangle (255) at the specified bounding box coordinates [x, y, width, height].
+
+    Args:
+        height: Image or canvas height in pixels.
+        width: Image or canvas width in pixels.
+        bbox: Bounding box coordinates [x, y, width, height].
+
+    Returns:
+        np.ndarray: Pure black mask with pure white rectangle (H, W) uint8.
+    """
+    mask = np.zeros((height, width), dtype=np.uint8)
+    if not bbox or len(bbox) < 4:
+        return mask
+
+    try:
+        x, y, w, h = int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3])
+    except (ValueError, TypeError, IndexError):
+        return mask
+
+    if w <= 0 or h <= 0:
+        return mask
+
+    # Clamp coordinates cleanly to image boundaries
+    x1 = max(0, min(width, x))
+    y1 = max(0, min(height, y))
+    x2 = max(0, min(width, x + w))
+    y2 = max(0, min(height, y + h))
+
+    if x2 > x1 and y2 > y1:
+        mask[y1:y2, x1:x2] = 255
+
+    return mask
+
+
+def apply_removal_mode(
+    image_rgb: np.ndarray,
+    mask: Optional[np.ndarray] = None,
+    bbox: Optional[Union[Tuple[int, int, int, int], Any]] = None,
+    mode: str = "Inpaint (Content-Aware Fill)",
+    inpainter: Optional["InpaintingLaMa"] = None,
+    composite: bool = True
+) -> np.ndarray:
+    """
+    Executes specified watermark removal algorithm on an RGB image using a bounding box and/or mask:
+
+    Supported Removal Modes:
+    1. "Inpaint (Content-Aware Fill)": Uses the existing LaMa deep learning neural network.
+    2. "Gaussian Blur Blend": Uses OpenCV cv2.GaussianBlur strictly within the white bounding box area.
+    3. "Pixelate": Resizes the box area down and back up using nearest-neighbor interpolation in OpenCV.
+    4. "Smooth Edge Interpolation": Uses OpenCV cv2.inpaint with the Navier-Stokes algorithm (INPAINT_NS).
+
+    Args:
+        image_rgb: Source RGB image array (H, W, 3) uint8.
+        mask: Optional binary mask (H, W) uint8 (auto-generated from bbox if None).
+        bbox: Optional [x, y, width, height] bounding box coordinates.
+        mode: Selected removal mode string.
+        inpainter: InpaintingLaMa instance (instantiated if None and required).
+        composite: If True, guarantees unmasked pixels are preserved byte-for-byte.
+
+    Returns:
+        np.ndarray: Cleaned RGB image (H, W, 3) uint8.
+    """
+    h, w = image_rgb.shape[:2]
+
+    # Resolve bounding box coordinates
+    x1, y1, x2, y2 = 0, 0, 0, 0
+    if bbox is not None and len(bbox) >= 4:
+        try:
+            bx, by, bw, bh = int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3])
+            if bw > 0 and bh > 0:
+                x1 = max(0, min(w, bx))
+                y1 = max(0, min(h, by))
+                x2 = max(0, min(w, bx + bw))
+                y2 = max(0, min(h, by + bh))
+                if mask is None:
+                    mask = generate_bbox_mask(h, w, bbox)
+        except (ValueError, TypeError, IndexError):
+            pass
+
+    if mask is None:
+        mask = np.zeros((h, w), dtype=np.uint8)
+
+    # If coordinates were not derived from bbox, extract them from mask contours
+    if (x2 <= x1 or y2 <= y1) and np.count_nonzero(mask == 255) > 0:
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if contours:
+            bx, by, bw, bh = cv2.boundingRect(np.vstack(contours))
+            x1 = max(0, min(w, bx))
+            y1 = max(0, min(h, by))
+            x2 = max(0, min(w, bx + bw))
+            y2 = max(0, min(h, by + bh))
+
+    # Mode 1: Gaussian Blur Blend (strictly within the white bounding box area)
+    if mode == "Gaussian Blur Blend":
+        res = image_rgb.copy()
+        if x2 > x1 and y2 > y1:
+            roi = res[y1:y2, x1:x2]
+            box_w, box_h = roi.shape[1], roi.shape[0]
+            kw = min(45, max(3, (box_w // 2) * 2 + 1))
+            kh = min(45, max(3, (box_h // 2) * 2 + 1))
+            blurred_roi = cv2.GaussianBlur(roi, (kw, kh), 0)
+            res[y1:y2, x1:x2] = blurred_roi
+        return res
+
+    # Mode 2: Pixelate (resize the box area down and back up using nearest-neighbor interpolation)
+    elif mode == "Pixelate":
+        res = image_rgb.copy()
+        if x2 > x1 and y2 > y1:
+            roi = res[y1:y2, x1:x2]
+            box_w, box_h = roi.shape[1], roi.shape[0]
+            sw = max(1, box_w // 10)
+            sh = max(1, box_h // 10)
+            small = cv2.resize(roi, (sw, sh), interpolation=cv2.INTER_LINEAR)
+            pixelated = cv2.resize(small, (box_w, box_h), interpolation=cv2.INTER_NEAREST)
+            res[y1:y2, x1:x2] = pixelated
+        return res
+
+    # Mode 3: Smooth Edge Interpolation (cv2.inpaint with Navier-Stokes algorithm INPAINT_NS)
+    elif mode == "Smooth Edge Interpolation":
+        bgr = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2BGR)
+        binary_mask = (mask > 127).astype(np.uint8) * 255
+        inpainted_bgr = cv2.inpaint(bgr, binary_mask, inpaintRadius=5, flags=cv2.INPAINT_NS)
+        inpainted_rgb = cv2.cvtColor(inpainted_bgr, cv2.COLOR_BGR2RGB)
+        if composite:
+            m = (binary_mask > 0)[:, :, None]
+            return np.where(m, inpainted_rgb, image_rgb)
+        return inpainted_rgb
+
+    # Mode 4: Inpaint (Content-Aware Fill) (uses the existing LaMa neural network)
+    else:
+        if inpainter is None:
+            inpainter = InpaintingLaMa()
+        return inpainter.inpaint(image=image_rgb, mask=mask, composite=composite, is_bgr=False)
+
+
 class FastFourierConvBlock(nn.Module):
     """
     Representative Fast Fourier Convolution (FFC) residual block
@@ -485,6 +627,26 @@ class InpaintingLaMa:
             # Prevent CUDA memory fragmentation
             if self.device.type == "cuda":
                 torch.cuda.empty_cache()
+
+    def inpaint_with_mode(
+        self,
+        image_rgb: np.ndarray,
+        mask: Optional[np.ndarray] = None,
+        bbox: Optional[Union[Tuple[int, int, int, int], Any]] = None,
+        mode: str = "Inpaint (Content-Aware Fill)",
+        composite: bool = True
+    ) -> np.ndarray:
+        """
+        Executes specified removal mode using this InpaintingLaMa instance.
+        """
+        return apply_removal_mode(
+            image_rgb=image_rgb,
+            mask=mask,
+            bbox=bbox,
+            mode=mode,
+            inpainter=self,
+            composite=composite
+        )
 
     @staticmethod
     def save_result(image_rgb: np.ndarray, output_path: Union[str, Path]) -> Path:

@@ -37,7 +37,7 @@ except ImportError:
         HAS_MOVIEPY = False
 
 from core.mask_generator import WatermarkDetector
-from core.inpaint_engine import InpaintingLaMa
+from core.inpaint_engine import InpaintingLaMa, generate_bbox_mask, apply_removal_mode
 
 # Structured Logger
 logger = logging.getLogger("WatermarkRemoverAI.VideoProcessor")
@@ -85,50 +85,21 @@ def _apply_removal_mode(
     mask: np.ndarray,
     mode: str,
     inpainter: InpaintingLaMa,
+    bbox: Optional[Tuple[int, int, int, int]] = None,
     composite: bool = True
 ) -> np.ndarray:
     """
     Executes specified watermark removal algorithm on an RGB frame.
-
-    Supported Modes:
-    - "Smooth Edge Interpolation": Bilateral/Navier-Stokes edge-preserving inpainting.
-    - "Gaussian Blur Blend": Heavy Gaussian blur with smooth edge alpha-feathering.
-    - "Pixelate": Mosaic downsampling and nearest-neighbor reconstruction.
-    - "Inpaint (Content-Aware Fill)": Neural LaMa Fast Fourier Convolution inpainting.
+    Delegates to the canonical core.inpaint_engine.apply_removal_mode.
     """
-    if mode == "Smooth Edge Interpolation":
-        bgr = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2BGR)
-        inpainted_bgr = cv2.inpaint(bgr, mask, 5, cv2.INPAINT_TELEA)
-        res = cv2.cvtColor(inpainted_bgr, cv2.COLOR_BGR2RGB)
-        if composite:
-            m = (mask > 0)[:, :, None]
-            res = np.where(m, res, image_rgb)
-        return res
-
-    elif mode == "Gaussian Blur Blend":
-        ksize = (35, 35)
-        blurred = cv2.GaussianBlur(image_rgb, ksize, 15)
-        feathered_mask = cv2.GaussianBlur(mask.astype(np.float32) / 255.0, (15, 15), 0)[:, :, None]
-        blended = (blurred * feathered_mask + image_rgb * (1.0 - feathered_mask)).clip(0, 255).astype(np.uint8)
-        return blended
-
-    elif mode == "Pixelate":
-        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        res = image_rgb.copy()
-        for cnt in contours:
-            x, y, w, h = cv2.boundingRect(cnt)
-            if w <= 0 or h <= 0:
-                continue
-            roi = res[y:y+h, x:x+w]
-            sw, sh = max(1, w // 10), max(1, h // 10)
-            small = cv2.resize(roi, (sw, sh), interpolation=cv2.INTER_LINEAR)
-            pixelated = cv2.resize(small, (w, h), interpolation=cv2.INTER_NEAREST)
-            res[y:y+h, x:x+w] = pixelated
-        return res
-
-    else:
-        # Default: "Inpaint (Content-Aware Fill)" via LaMa
-        return inpainter.inpaint(image=image_rgb, mask=mask, composite=composite, is_bgr=False)
+    return apply_removal_mode(
+        image_rgb=image_rgb,
+        mask=mask,
+        bbox=bbox,
+        mode=mode,
+        inpainter=inpainter,
+        composite=composite
+    )
 
 
 class VideoWatermarkRemover:
@@ -391,15 +362,8 @@ class VideoWatermarkRemover:
             # Pre-parse static mask or bbox if provided by user
             predefined_mask: Optional[np.ndarray] = None
             if bbox is not None:
-                bx, by, bw, bh = bbox
-                predefined_mask = np.zeros((orig_height, orig_width), dtype=np.uint8)
-                x1 = max(0, min(orig_width - 1, int(bx)))
-                y1 = max(0, min(orig_height - 1, int(by)))
-                x2 = max(0, min(orig_width, int(bx + bw)))
-                y2 = max(0, min(orig_height, int(by + bh)))
-                if x2 > x1 and y2 > y1:
-                    predefined_mask[y1:y2, x1:x2] = 255
-                    logger.info("Custom bounding box mask set: [X:%d->%d, Y:%d->%d, W:%d, H:%d]", x1, x2, y1, y2, x2-x1, y2-y1)
+                predefined_mask = generate_bbox_mask(orig_height, orig_width, bbox)
+                logger.info("Custom bounding box mask set via generate_bbox_mask: %s", bbox)
             elif mask is not None:
                 if isinstance(mask, (str, Path)):
                     mask_img = cv2.imread(str(mask), cv2.IMREAD_GRAYSCALE)

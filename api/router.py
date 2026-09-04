@@ -20,7 +20,7 @@ import logging
 import base64
 import asyncio
 from pathlib import Path
-from typing import Optional, Dict, Any, Tuple
+from typing import Optional, Dict, Any, Tuple, List, Union
 from datetime import datetime
 
 import cv2
@@ -38,7 +38,7 @@ except ImportError:
 
 from core.config import settings
 from core.mask_generator import WatermarkDetector
-from core.inpaint_engine import InpaintingLaMa
+from core.inpaint_engine import InpaintingLaMa, generate_bbox_mask, apply_removal_mode
 from core.video_processor import VideoWatermarkRemover
 
 logger = logging.getLogger("WatermarkRemoverAI.API")
@@ -68,6 +68,8 @@ class UploadResponse(BaseModel):
 class ProcessRequest(BaseModel):
     job_id: Optional[str] = Field(None, description="UUID of previously uploaded image")
     image_base64: Optional[str] = Field(None, description="Base64-encoded image string for direct processing")
+    bbox: Optional[List[int]] = Field(None, description="Bounding box coordinates [x, y, width, height]")
+    removal_mode: str = Field("Inpaint (Content-Aware Fill)", description="Removal Mode: 'Inpaint (Content-Aware Fill)', 'Gaussian Blur Blend', 'Pixelate', 'Smooth Edge Interpolation'")
     mask_base64: Optional[str] = Field(None, description="Optional base64-encoded user-drawn brush mask")
     confidence_threshold: float = Field(0.5, ge=0.0, le=1.0, description="Confidence threshold for mask detection")
     composite: bool = Field(True, description="Enforce byte-for-byte fidelity in clean background areas")
@@ -256,11 +258,20 @@ def execute_watermark_removal(job_id: str, request: ProcessRequest) -> Dict[str,
     img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
     h, w = img_rgb.shape[:2]
 
-    # Determine mask source (Human-in-the-loop custom mask or automated detector)
-    if request.mask_base64:
+    # Determine mask source (Bounding box, user-drawn mask, or automated detector)
+    if request.bbox and len(request.bbox) == 4 and request.bbox[2] > 0 and request.bbox[3] > 0:
+        mask = generate_bbox_mask(height=h, width=w, bbox=request.bbox)
+        diagnostics = {
+            "method_used": "bounding_box",
+            "bbox": request.bbox,
+            "removal_mode": request.removal_mode,
+            "coverage_percentage": float(np.count_nonzero(mask == 255) / mask.size * 100),
+        }
+    elif request.mask_base64:
         mask = decode_base64_mask(request.mask_base64, target_shape=(h, w))
         diagnostics = {
             "method_used": "human_in_the_loop_brush",
+            "removal_mode": request.removal_mode,
             "coverage_percentage": float(np.count_nonzero(mask == 255) / mask.size * 100),
             "device": "user_canvas"
         }
@@ -269,14 +280,18 @@ def execute_watermark_removal(job_id: str, request: ProcessRequest) -> Dict[str,
             image=img_rgb,
             return_diagnostics=True
         )
+        diagnostics["removal_mode"] = request.removal_mode
 
     mask_path = job_dir / "mask.png"
     service.detector.save_mask(mask, mask_path)
 
-    # Execute LaMa Inpainting using verified RGB image
-    cleaned_rgb = service.inpainter.inpaint(
-        image=img_rgb,
+    # Execute selected removal mode algorithm
+    cleaned_rgb = apply_removal_mode(
+        image_rgb=img_rgb,
         mask=mask,
+        bbox=request.bbox,
+        mode=request.removal_mode,
+        inpainter=service.inpainter,
         composite=request.composite
     )
     result_path = job_dir / "cleaned.png"
@@ -295,6 +310,8 @@ def execute_watermark_removal(job_id: str, request: ProcessRequest) -> Dict[str,
         "duration_seconds": duration,
         "mask_file": str(mask_path.name),
         "result_file": str(result_path.name),
+        "removal_mode": request.removal_mode,
+        "bbox": request.bbox,
         "diagnostics": diagnostics,
         "completed_at": datetime.utcnow().isoformat()
     })
