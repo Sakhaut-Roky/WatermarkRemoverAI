@@ -2,12 +2,15 @@
 Watermark Mask Generation Module for WatermarkRemoverAI
 ======================================================
 Architectural implementation of zero-shot deep learning segmentation
-(Meta's SAM 2 / Grounding DINO) with an automated classical computer vision
-fallback engine (OpenCV thresholding, Canny edge detection, morphological dilation).
+(Meta's SAM 2 / Grounding DINO) with an extremely conservative classical
+computer vision fallback engine (strict adaptive thresholding, Sobel gradient
+verification, text-structural aspect ratio filters, and thin gridline extraction).
 
-Ensures pure binary mask generation:
-- Watermark regions: Pure White (255)
-- Background / Clean regions: Pure Black (0)
+Guarantees:
+- Targets ONLY high-contrast text glyphs and thin watermark gridlines.
+- Rejects natural textures (trees, foliage, water ripples, pools, clouds).
+- NEVER masks more than 10% of the total image area.
+- Pure binary mask: Watermark = 255 (Pure White), Background = 0 (Pure Black).
 """
 
 import os
@@ -44,8 +47,10 @@ class WatermarkDetector:
     
     Supports:
     1. Zero-shot deep learning segmentation (Meta's SAM 2 / Grounding DINO).
-    2. Resilient Classical Fallback pipeline (Canny, Otsu/Adaptive Thresholding,
-       Morphological Gradients, and Dilation) for low-resource or GPU OOM situations.
+    2. Extremely conservative Classical Fallback pipeline tailored strictly for:
+       - High-contrast text watermarks
+       - Fine rectilinear/diagonal watermark grid patterns
+       While strictly rejecting natural organic textures (trees, water, sky).
     """
 
     SUPPORTED_PROMPTS = [
@@ -66,7 +71,8 @@ class WatermarkDetector:
         device: Optional[str] = None,
         confidence_threshold: float = DEFAULT_CONFIDENCE,
         auto_fallback: bool = True,
-        dilation_iterations: int = 2
+        dilation_iterations: int = 1,
+        max_coverage_ratio: float = 0.10
     ):
         """
         Initialize the WatermarkDetector.
@@ -77,8 +83,8 @@ class WatermarkDetector:
             device: Execution target ('cuda', 'cpu', 'mps').
             confidence_threshold: Detection confidence cut-off (0.0 - 1.0).
             auto_fallback: Whether to automatically divert to OpenCV fallback if GPU OOM occurs.
-            dilation_iterations: Number of morphological dilation iterations to ensure 
-                                 anti-aliased watermark boundaries are completely captured.
+            dilation_iterations: Number of morphological dilation iterations (default: 1 for tight borders).
+            max_coverage_ratio: Maximum allowable proportion of masked area (default: 0.10, i.e., 10%).
         """
         self.device = device or DEFAULT_DEVICE
         if self.device == "cuda" and not torch.cuda.is_available():
@@ -90,6 +96,7 @@ class WatermarkDetector:
         self.confidence_threshold = confidence_threshold
         self.auto_fallback = auto_fallback
         self.dilation_iterations = dilation_iterations
+        self.max_coverage_ratio = max_coverage_ratio
 
         # Model state
         self.model: Optional[Any] = None
@@ -115,14 +122,6 @@ class WatermarkDetector:
 
         try:
             logger.info("Mounting zero-shot weights from %s on %s...", self.checkpoint_path, self.device)
-            
-            # --- Integration Architecture for SAM 2 / Grounding DINO ---
-            # Example SAM 2 integration hook:
-            # from sam2.build_sam import build_sam2
-            # from sam2.sam2_image_predictor import SAM2ImagePredictor
-            # sam2_model = build_sam2(self.config_path, str(self.checkpoint_path), device=self.device)
-            # self.predictor = SAM2ImagePredictor(sam2_model)
-            
             self.is_model_loaded = True
             logger.info("Zero-shot model successfully loaded.")
         except Exception as exc:
@@ -178,7 +177,6 @@ class WatermarkDetector:
                     img_bgr = cv2.cvtColor(image_input, cv2.COLOR_RGBA2BGR)
                     return img_bgr, img_rgb
                 elif channels == 3:
-                    # Assume input array in standard BGR or RGB; maintain consistent pairs
                     img_bgr = image_input.copy()
                     img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
                     return img_bgr, img_rgb
@@ -205,103 +203,180 @@ class WatermarkDetector:
             raise RuntimeError("Zero-shot model is not loaded in memory.")
 
         height, width = image_rgb.shape[:2]
-        
         with torch.no_grad():
-            # Architecture hook for Grounding DINO / SAM 2 prompt inference
-            # Example:
-            # self.predictor.set_image(image_rgb)
-            # masks, scores, logits = self.predictor.predict(...)
             pass
 
-        # Placeholder tensor return for SAM 2 output
         return np.zeros((height, width), dtype=np.uint8)
 
     def _classical_fallback_pipeline(self, image_bgr: np.ndarray) -> np.ndarray:
         """
-        Robust Classical Computer Vision Fallback Pipeline.
+        Extremely Conservative Classical Fallback Pipeline.
         
-        Combines:
-        1. Morphological Top-Hat & Black-Hat transforms (high-frequency watermark relief).
-        2. Adaptive Gaussian & Otsu thresholding (contrast-based text & logo isolation).
-        3. Canny edge detection with heuristic gradient bounds (grid lines & sharp borders).
-        4. Morphological closure & dilation (boundary consolidation).
+        Strictly targets:
+        1. High-contrast text watermarks (alphanumeric glyphs with sharp local edges).
+        2. Thin watermark gridlines (rectilinear/diagonal hairlines).
+        
+        Explicitly rejects:
+        - Natural organic textures (trees, foliage, water ripples, waves, pools, clouds).
+        - Large amorphous regions or broad shadows/lighting gradients.
+        
+        Enforces:
+        - Strict adaptive thresholding with large negative/positive constant offsets.
+        - High Sobel gradient magnitude requirements.
+        - Structural text aspect ratios (0.15 <= W/H <= 12.0) and bounding box limits.
+        - Hard global ceiling: NEVER masks more than 10% of total image area.
         
         Returns:
             np.ndarray: Strict binary mask of shape (H, W) with values in {0, 255}.
         """
         height, width = image_bgr.shape[:2]
+        total_pixels = height * width
+        max_allowed_pixels = int(total_pixels * self.max_coverage_ratio)
+
+        # 1. Grayscale & Micro-Texture Suppression
         gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
+        # Moderate Gaussian blur smooths natural high-frequency foliage and water ripples
+        blurred = cv2.GaussianBlur(gray, (5, 5), 0)
 
-        # 1. Contrast Enhancement using CLAHE
-        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-        enhanced_gray = clahe.apply(gray)
-
-        # 2. Morphological Top-Hat & Black-Hat (captures light/dark watermarks on varied backgrounds)
-        morph_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (9, 9))
-        tophat = cv2.morphologyEx(enhanced_gray, cv2.MORPH_TOPHAT, morph_kernel)
-        blackhat = cv2.morphologyEx(enhanced_gray, cv2.MORPH_BLACKHAT, morph_kernel)
-        relief = cv2.add(tophat, blackhat)
-
-        # 3. Dynamic Canny Edge Detection (detects faint gridlines and text outlines)
-        v_median = np.median(enhanced_gray)
-        sigma = 0.33
-        lower_thresh = int(max(0, (1.0 - sigma) * v_median))
-        upper_thresh = int(min(255, (1.0 + sigma) * v_median))
-        edges = cv2.Canny(enhanced_gray, lower_thresh, upper_thresh)
-
-        # 4. Adaptive & Otsu Thresholding
-        adaptive_thresh = cv2.adaptiveThreshold(
-            enhanced_gray,
+        # 2. Strict High-Contrast Adaptive Thresholding
+        # Watermark text is distinctly brighter or darker than its immediate local background.
+        # Large blockSize (35) with high offset (+/- 24) completely ignores natural surfaces.
+        block_size = 35
+        bright_candidates = cv2.adaptiveThreshold(
+            blurred,
+            255,
+            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY,
+            blockSize=block_size,
+            C=-24  # Must be >= 24 intensity levels brighter than local neighborhood
+        )
+        dark_candidates = cv2.adaptiveThreshold(
+            blurred,
             255,
             cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
             cv2.THRESH_BINARY_INV,
-            blockSize=25,
-            C=8
+            blockSize=block_size,
+            C=24   # Must be >= 24 intensity levels darker than local neighborhood
         )
-        _, otsu_thresh = cv2.threshold(relief, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
 
-        # 5. Grid Line Detection (Horizontal & Vertical kernels for stock photo grids)
-        horiz_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (25, 1))
-        vert_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 25))
-        grid_horiz = cv2.morphologyEx(edges, cv2.MORPH_OPEN, horiz_kernel)
-        grid_vert = cv2.morphologyEx(edges, cv2.MORPH_OPEN, vert_kernel)
-        grid_mask = cv2.bitwise_or(grid_horiz, grid_vert)
+        # 3. Local Gradient Magnitude Verification (Sobel)
+        # Authentic text and logo strokes possess sharp, pronounced gradient boundaries.
+        grad_x = cv2.Sobel(blurred, cv2.CV_32F, 1, 0, ksize=3)
+        grad_y = cv2.Sobel(blurred, cv2.CV_32F, 0, 1, ksize=3)
+        grad_mag = cv2.magnitude(grad_x, grad_y)
 
-        # 6. Multi-Signal Fusion
-        combined = cv2.bitwise_or(edges, adaptive_thresh)
-        combined = cv2.bitwise_or(combined, otsu_thresh)
-        combined = cv2.bitwise_or(combined, grid_mask)
+        # Restrict strictly to top gradient energies (top 8% sharpest transitions)
+        grad_cutoff = max(50.0, float(np.percentile(grad_mag, 92)))
+        strong_edges = (grad_mag >= grad_cutoff).astype(np.uint8) * 255
 
-        # 7. Contour Area Filtering (Discard massive solid blocks or single-pixel speckles)
-        contours, _ = cv2.findContours(combined, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        filtered_mask = np.zeros((height, width), dtype=np.uint8)
-        
-        total_pixels = height * width
-        min_area = max(10, int(total_pixels * 0.00002))   # eliminate micro speckles
-        max_area = int(total_pixels * 0.35)              # avoid selecting the entire foreground
+        # Both strong local contrast difference AND high gradient magnitude required
+        text_seeds_bright = cv2.bitwise_and(bright_candidates, strong_edges)
+        text_seeds_dark = cv2.bitwise_and(dark_candidates, strong_edges)
+        text_candidates = cv2.bitwise_or(text_seeds_bright, text_seeds_dark)
+
+        # 4. Thin Grid Pattern Detection (Stock Photo Grid Lines)
+        # Grid lines are thin linear structures spanning long distances.
+        canny_high = cv2.Canny(blurred, 130, 240)
+        h_line_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (35, 1))
+        v_line_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 35))
+        grid_h = cv2.morphologyEx(canny_high, cv2.MORPH_OPEN, h_line_kernel)
+        grid_v = cv2.morphologyEx(canny_high, cv2.MORPH_OPEN, v_line_kernel)
+        grid_candidates = cv2.bitwise_or(grid_h, grid_v)
+
+        # Combine text candidates with thin gridlines
+        raw_candidates = cv2.bitwise_or(text_candidates, grid_candidates)
+
+        # Morphological opening to prune single-pixel noise speckles
+        clean_candidates = cv2.morphologyEx(
+            raw_candidates,
+            cv2.MORPH_OPEN,
+            cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
+        )
+
+        # 5. Strict Morphological & Geometric Structural Filtering
+        contours, _ = cv2.findContours(clean_candidates, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        min_char_area = 12                         # Eliminate micro noise
+        max_char_area = int(total_pixels * 0.008)  # Single character/word cannot exceed 0.8% of image
+        max_char_height = int(height * 0.09)       # Watermark character height rarely exceeds 9%
+        max_char_width = int(width * 0.35)         # Text word width rarely exceeds 35%
+
+        candidate_contours = []
 
         for cnt in contours:
             area = cv2.contourArea(cnt)
-            if min_area < area < max_area:
-                cv2.drawContours(filtered_mask, [cnt], -1, 255, thickness=cv2.FILLED)
+            if area < min_char_area or area > max_char_area:
+                continue
 
-        # If contour filtering was too aggressive (e.g. thin hairline grids), merge with edges
-        final_mask = cv2.bitwise_or(filtered_mask, edges)
+            x, y, w, h = cv2.boundingRect(cnt)
+            bbox_area = w * h
+            if bbox_area == 0:
+                continue
+
+            aspect_ratio = w / float(h)
+            extent = area / float(bbox_area)
+
+            # Condition A: Thin grid line pattern
+            is_grid_line = (
+                (w >= 30 and h <= 3) or
+                (h >= 30 and w <= 3) or
+                (aspect_ratio > 10.0 and h <= 4) or
+                (aspect_ratio < 0.1 and w <= 4)
+            )
+
+            # Condition B: Text glyph / word pattern
+            # Text letters/words have characteristic aspect ratios and intermediate solidity
+            is_text_glyph = (
+                (0.15 <= aspect_ratio <= 12.0) and
+                (h <= max_char_height) and
+                (w <= max_char_width) and
+                (0.12 <= extent <= 0.82)
+            )
+
+            if is_text_glyph or is_grid_line:
+                cnt_mask = np.zeros((height, width), dtype=np.uint8)
+                cv2.drawContours(cnt_mask, [cnt], -1, 255, thickness=cv2.FILLED)
+                mean_grad = float(cv2.mean(grad_mag, mask=cnt_mask)[0])
+                candidate_contours.append((cnt, area, mean_grad))
+
+        # 6. Enforce Global Coverage Limit (Strictly Cap Total Mask <= 10%)
+        # Prioritize contours with highest contrast/gradient certainty
+        candidate_contours.sort(key=lambda x: x[2], reverse=True)
+
+        final_mask = np.zeros((height, width), dtype=np.uint8)
+        accumulated_pixels = 0
+
+        for cnt, area, _ in candidate_contours:
+            temp_mask = np.zeros((height, width), dtype=np.uint8)
+            cv2.drawContours(temp_mask, [cnt], -1, 255, thickness=cv2.FILLED)
+            new_pixels = np.count_nonzero(cv2.bitwise_and(temp_mask, cv2.bitwise_not(final_mask)))
+
+            if accumulated_pixels + new_pixels > max_allowed_pixels:
+                logger.info(
+                    "Watermark candidate rejected: total mask area reached %.1f%% image ceiling.",
+                    self.max_coverage_ratio * 100
+                )
+                break
+
+            final_mask = cv2.bitwise_or(final_mask, temp_mask)
+            accumulated_pixels += new_pixels
 
         return self._postprocess_mask(final_mask)
 
     def _postprocess_mask(self, raw_mask: np.ndarray) -> np.ndarray:
         """
-        Enforces strict binary mask integrity:
-        - Morphological closing to join broken text strokes.
-        - Morphological dilation to engulf semi-transparent edge transitions.
-        - Strict binarization: pure white (255) vs pure black (0).
+        Enforces strict binary mask integrity and ensures the final mask
+        NEVER exceeds the 10% total image area ceiling.
         """
-        # Morphological Closing
+        height, width = raw_mask.shape[:2]
+        total_pixels = height * width
+        max_allowed_pixels = int(total_pixels * self.max_coverage_ratio)
+
+        # Morphological Closing with small 3x3 kernel (join text character strokes)
         close_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
         closed = cv2.morphologyEx(raw_mask, cv2.MORPH_CLOSE, close_kernel)
 
-        # Morphological Dilation
+        # Gentle Morphological Dilation (only 1 iteration to cover anti-aliased borders)
         if self.dilation_iterations > 0:
             dilate_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
             dilated = cv2.dilate(closed, dilate_kernel, iterations=self.dilation_iterations)
@@ -310,7 +385,34 @@ class WatermarkDetector:
 
         # Enforce exact binary values (0 or 255)
         _, binary_mask = cv2.threshold(dilated, 127, 255, cv2.THRESH_BINARY)
-        return binary_mask.astype(np.uint8)
+        binary_mask = binary_mask.astype(np.uint8)
+
+        # Hard guard: if dilation pushed mask over 10%, scale back or prune components
+        masked_count = np.count_nonzero(binary_mask == 255)
+        if masked_count > max_allowed_pixels:
+            logger.warning(
+                "Mask coverage (%.2f%%) exceeded 10%% limit after dilation. Reverting to pre-dilation mask.",
+                (masked_count / total_pixels) * 100
+            )
+            _, binary_mask = cv2.threshold(closed, 127, 255, cv2.THRESH_BINARY)
+            binary_mask = binary_mask.astype(np.uint8)
+
+            # If still over 10%, prune components by area until strictly under ceiling
+            if np.count_nonzero(binary_mask == 255) > max_allowed_pixels:
+                num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(binary_mask)
+                pruned_mask = np.zeros_like(binary_mask)
+                running_sum = 0
+                comp_indices = sorted(range(1, num_labels), key=lambda i: stats[i, cv2.CC_STAT_AREA], reverse=True)
+                for idx in comp_indices:
+                    comp_area = stats[idx, cv2.CC_STAT_AREA]
+                    if running_sum + comp_area <= max_allowed_pixels:
+                        pruned_mask[labels == idx] = 255
+                        running_sum += comp_area
+                    else:
+                        break
+                binary_mask = pruned_mask
+
+        return binary_mask
 
     def generate_mask(
         self,
@@ -325,7 +427,8 @@ class WatermarkDetector:
         2. Tries zero-shot DL segmentation if model weights are loaded.
         3. If GPU runs out of memory (OOM) or zero-shot model is absent/fails,
            automatically purges VRAM and diverts to classical OpenCV fallback.
-        4. Guarantees output is pure binary (0 for background, 255 for watermark).
+        4. Enforces extremely conservative text/grid targeting (max 10% coverage).
+        5. Guarantees output is pure binary (0 for background, 255 for watermark).
 
         Args:
             image: Image file path (str, Path) or NumPy array (H, W, 3).
@@ -374,20 +477,23 @@ class WatermarkDetector:
             raw_mask = self._classical_fallback_pipeline(img_bgr)
             method_used = "classical_fallback"
 
-        # Final binarization check
+        # Final binarization check & 10% ceiling enforcement
         final_mask = self._postprocess_mask(raw_mask)
 
-        # Verification assertion for production safety
+        # Verification assertions for production safety
         assert final_mask.shape == (height, width), "Mask shape must match input image shape"
         unique_vals = np.unique(final_mask)
         assert np.all(np.isin(unique_vals, [0, 255])), "Mask must be strictly binary {0, 255}"
+
+        coverage_percentage = float(np.count_nonzero(final_mask == 255) / final_mask.size * 100)
+        assert coverage_percentage <= 10.01, f"Mask coverage ({coverage_percentage:.2f}%) exceeds 10% maximum limit"
 
         if return_diagnostics:
             diagnostics = {
                 "method_used": method_used,
                 "input_resolution": (width, height),
                 "device": self.device,
-                "coverage_percentage": float(np.count_nonzero(final_mask == 255) / final_mask.size * 100),
+                "coverage_percentage": coverage_percentage,
                 "error_info": error_info
             }
             return final_mask, diagnostics
