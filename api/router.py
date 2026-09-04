@@ -237,7 +237,9 @@ def execute_watermark_removal(job_id: str, request: ProcessRequest) -> Dict[str,
             raise FileNotFoundError(f"Original image asset missing for job: {job_id}")
         img_bgr = cv2.imread(str(original_path), cv2.IMREAD_COLOR)
 
-    h, w = img_bgr.shape[:2]
+    # Immediately convert BGR from cv2.imread/cv2.imdecode to RGB
+    img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+    h, w = img_rgb.shape[:2]
 
     # Determine mask source (Human-in-the-loop custom mask or automated detector)
     if request.mask_base64:
@@ -249,25 +251,26 @@ def execute_watermark_removal(job_id: str, request: ProcessRequest) -> Dict[str,
         }
     else:
         mask, diagnostics = service.detector.generate_mask(
-            image=img_bgr,
+            image=img_rgb,
             return_diagnostics=True
         )
 
     mask_path = job_dir / "mask.png"
     service.detector.save_mask(mask, mask_path)
 
-    # Execute LaMa Inpainting
+    # Execute LaMa Inpainting using verified RGB image
     cleaned_rgb = service.inpainter.inpaint(
-        image=img_bgr,
+        image=img_rgb,
         mask=mask,
         composite=request.composite
     )
     result_path = job_dir / "cleaned.png"
+    # save_result converts RGB to BGR before writing with cv2.imwrite to disk
     service.inpainter.save_result(cleaned_rgb, result_path)
 
     duration = round(time.time() - start_time, 4)
 
-    # Encode base64 strings for direct client response
+    # Encode base64 strings for direct client response (Gradio renders in RGB)
     result_base64 = encode_image_to_base64(cleaned_rgb, is_rgb=True)
     mask_base64 = encode_image_to_base64(mask, is_rgb=False)
 

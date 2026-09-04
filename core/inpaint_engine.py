@@ -259,11 +259,13 @@ class InpaintingLaMa:
     def preprocess(
         self,
         image: Union[str, Path, np.ndarray, torch.Tensor],
-        mask: Union[str, Path, np.ndarray, torch.Tensor]
+        mask: Union[str, Path, np.ndarray, torch.Tensor],
+        is_bgr: bool = False
     ) -> Tuple[torch.Tensor, torch.Tensor, Tuple[int, int, int, int], Tuple[int, int], np.ndarray]:
         """
         Preprocesses image and binary mask:
-        - Validates dimensions & channel format (RGB conversion).
+        - Validates dimensions & channel format. Whenever cv2.imread is used,
+          it is immediately converted from BGR to RGB via cv2.cvtColor.
         - Scales pixels to [0.0, 1.0] float32.
         - Transforms to (B, C, H, W) PyTorch tensors.
         - Pads spatial dimensions to modulo constraint.
@@ -281,6 +283,7 @@ class InpaintingLaMa:
             bgr = cv2.imread(str(image), cv2.IMREAD_COLOR)
             if bgr is None:
                 raise ValueError(f"Unable to read image at: {image}")
+            # Ensure immediately converted from BGR to RGB
             img_rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
         elif isinstance(image, np.ndarray):
             if image.ndim == 2:
@@ -288,7 +291,10 @@ class InpaintingLaMa:
             elif image.shape[2] == 4:
                 img_rgb = cv2.cvtColor(image, cv2.COLOR_RGBA2RGB)
             elif image.shape[2] == 3:
-                img_rgb = image.copy()
+                if is_bgr:
+                    img_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+                else:
+                    img_rgb = image.copy()
             else:
                 raise ValueError(f"Unsupported image shape: {image.shape}")
         elif isinstance(image, torch.Tensor):
@@ -400,7 +406,8 @@ class InpaintingLaMa:
         self,
         image: Union[str, Path, np.ndarray, torch.Tensor],
         mask: Union[str, Path, np.ndarray, torch.Tensor],
-        composite: bool = True
+        composite: bool = True,
+        is_bgr: bool = False
     ) -> np.ndarray:
         """
         Primary execution entry point for watermark removal.
@@ -409,12 +416,13 @@ class InpaintingLaMa:
             image: Source image containing watermarks.
             mask: Binary mask indicating watermark regions (255 = watermark, 0 = background).
             composite: If True, preserves original unmasked pixels byte-for-byte.
+            is_bgr: Set to True if NumPy image array is in BGR format (e.g. from cv2.imread).
 
         Returns:
             np.ndarray: Inpainted clean RGB image (H, W, 3) as np.uint8.
         """
-        # Preprocessing & Hardware routing
-        padded_img, padded_mask, pad_coords, orig_shape, orig_rgb = self.preprocess(image, mask)
+        # Preprocessing & Hardware routing (guarantees strictly RGB tensor and orig_rgb array)
+        padded_img, padded_mask, pad_coords, orig_shape, orig_rgb = self.preprocess(image, mask, is_bgr=is_bgr)
         
         # Binary mask representation for postprocessing
         if isinstance(mask, (str, Path)):

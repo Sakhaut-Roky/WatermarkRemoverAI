@@ -130,10 +130,13 @@ class WatermarkDetector:
 
     def _load_and_validate_image(
         self,
-        image_input: Union[str, Path, np.ndarray]
+        image_input: Union[str, Path, np.ndarray],
+        is_bgr: bool = False
     ) -> Tuple[np.ndarray, np.ndarray]:
         """
         Validates and standardizes input image from file path or NumPy array.
+        Whenever OpenCV (cv2.imread) is used, it is immediately converted
+        from BGR to RGB via cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB).
         
         Returns:
             Tuple of (image_bgr, image_rgb) as np.uint8 arrays of shape (H, W, 3).
@@ -146,9 +149,11 @@ class WatermarkDetector:
             if not path.is_file():
                 raise FileNotFoundError(f"Image file not found: {path.resolve()}")
             
+            # Read via OpenCV (BGR)
             img_bgr = cv2.imread(str(path), cv2.IMREAD_COLOR)
             if img_bgr is None:
                 raise ValueError(f"Could not decode image file: {path.resolve()}")
+            # Immediately convert from BGR to RGB
             img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
             return img_bgr, img_rgb
 
@@ -177,8 +182,13 @@ class WatermarkDetector:
                     img_bgr = cv2.cvtColor(image_input, cv2.COLOR_RGBA2BGR)
                     return img_bgr, img_rgb
                 elif channels == 3:
-                    img_bgr = image_input.copy()
-                    img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+                    if is_bgr:
+                        img_bgr = image_input.copy()
+                        img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+                    else:
+                        # By default, arrays in Python/PyTorch/PIL ecosystem are RGB
+                        img_rgb = image_input.copy()
+                        img_bgr = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR)
                     return img_bgr, img_rgb
                 elif channels == 1:
                     img_bgr = cv2.cvtColor(image_input[:, :, 0], cv2.COLOR_GRAY2BGR)
@@ -417,7 +427,8 @@ class WatermarkDetector:
     def generate_mask(
         self,
         image: Union[str, Path, np.ndarray],
-        return_diagnostics: bool = False
+        return_diagnostics: bool = False,
+        is_bgr: bool = False
     ) -> Union[np.ndarray, Tuple[np.ndarray, Dict[str, Any]]]:
         """
         Generates a watermark mask for the input image.
@@ -433,12 +444,13 @@ class WatermarkDetector:
         Args:
             image: Image file path (str, Path) or NumPy array (H, W, 3).
             return_diagnostics: If True, returns (mask, metadata_dict).
+            is_bgr: Set to True if NumPy array is in BGR format (e.g. from cv2.imread).
 
         Returns:
             np.ndarray: Pure binary mask (255 = watermark, 0 = background).
             (Optional) Dict containing detection metadata.
         """
-        img_bgr, img_rgb = self._load_and_validate_image(image)
+        img_bgr, img_rgb = self._load_and_validate_image(image, is_bgr=is_bgr)
         height, width = img_rgb.shape[:2]
 
         method_used = "classical_fallback"
