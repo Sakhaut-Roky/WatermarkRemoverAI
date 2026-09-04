@@ -16,6 +16,7 @@ torchvision>=0.17.0
 opencv-python>=4.9.0.80
 numpy>=1.26.0,<2.0.0
 Pillow>=10.2.0
+easyocr>=1.7.1
 
 # Interactive UI & Prototyping
 gradio>=4.20.0
