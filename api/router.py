@@ -311,6 +311,8 @@ def execute_video_watermark_removal(
     input_path: Path,
     output_path: Path,
     temp_frames_dir: Path,
+    bbox: Optional[Tuple[int, int, int, int]] = None,
+    removal_mode: str = "Inpaint (Content-Aware Fill)",
     static_mask: bool = False,
     composite: bool = True,
     max_duration: float = 10.0,
@@ -339,6 +341,8 @@ def execute_video_watermark_removal(
         result = remover.process_video(
             video_path=input_path,
             output_path=output_path,
+            bbox=bbox,
+            removal_mode=removal_mode,
             static_mask=static_mask,
             composite=composite,
         )
@@ -493,6 +497,8 @@ async def process_image(request: ProcessRequest):
 )
 async def process_video(
     file: UploadFile = File(..., description="Uploaded MP4 video file"),
+    bbox: Optional[str] = Query(None, description="Optional bounding box 'x,y,w,h' (integers)"),
+    removal_mode: str = Query("Inpaint (Content-Aware Fill)", description="Removal Mode: 'Smooth Edge Interpolation', 'Gaussian Blur Blend', 'Pixelate', 'Inpaint (Content-Aware Fill)'"),
     static_mask: bool = Query(False, description="Whether to reuse detected watermark mask across all frames for maximum speed"),
     composite: bool = Query(True, description="Preserve unmasked background pixels byte-for-byte"),
     max_duration: float = Query(10.0, ge=0.5, le=10.0, description="Maximum video duration to process in seconds (capped at 10.0s)"),
@@ -515,6 +521,17 @@ async def process_video(
             detail=f"Unsupported media format for '{original_filename}'. Only .mp4 video files are accepted."
         )
 
+    # Parse bbox if provided
+    parsed_bbox: Optional[Tuple[int, int, int, int]] = None
+    if bbox:
+        try:
+            parts = [int(p.strip()) for p in bbox.split(",") if p.strip()]
+            if len(parts) == 4 and parts[2] > 0 and parts[3] > 0:
+                parsed_bbox = (parts[0], parts[1], parts[2], parts[3])
+                logger.info("Parsed video bounding box from API request: %s", parsed_bbox)
+        except Exception as parse_err:
+            logger.warning("Failed to parse bbox query parameter '%s': %s", bbox, parse_err)
+
     # 2. Allocate isolated UUID workspace
     job_id = str(uuid.uuid4())
     job_dir = get_job_dir(job_id)
@@ -533,6 +550,8 @@ async def process_video(
         "result_file": "cleaned.mp4",
         "status": "uploading",
         "media_type": "video/mp4",
+        "removal_mode": removal_mode,
+        "bbox": list(parsed_bbox) if parsed_bbox else None,
         "created_at": now_iso,
     })
 
@@ -553,6 +572,8 @@ async def process_video(
                 input_path=input_video_path,
                 output_path=output_video_path,
                 temp_frames_dir=temp_frames_dir,
+                bbox=parsed_bbox,
+                removal_mode=removal_mode,
                 static_mask=static_mask,
                 composite=composite,
                 max_duration=max_duration,

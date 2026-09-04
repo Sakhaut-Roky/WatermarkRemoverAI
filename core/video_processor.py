@@ -80,6 +80,57 @@ def _set_audio_compat(clip: Any, audio_clip: Any) -> Any:
     return clip
 
 
+def _apply_removal_mode(
+    image_rgb: np.ndarray,
+    mask: np.ndarray,
+    mode: str,
+    inpainter: InpaintingLaMa,
+    composite: bool = True
+) -> np.ndarray:
+    """
+    Executes specified watermark removal algorithm on an RGB frame.
+
+    Supported Modes:
+    - "Smooth Edge Interpolation": Bilateral/Navier-Stokes edge-preserving inpainting.
+    - "Gaussian Blur Blend": Heavy Gaussian blur with smooth edge alpha-feathering.
+    - "Pixelate": Mosaic downsampling and nearest-neighbor reconstruction.
+    - "Inpaint (Content-Aware Fill)": Neural LaMa Fast Fourier Convolution inpainting.
+    """
+    if mode == "Smooth Edge Interpolation":
+        bgr = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2BGR)
+        inpainted_bgr = cv2.inpaint(bgr, mask, 5, cv2.INPAINT_TELEA)
+        res = cv2.cvtColor(inpainted_bgr, cv2.COLOR_BGR2RGB)
+        if composite:
+            m = (mask > 0)[:, :, None]
+            res = np.where(m, res, image_rgb)
+        return res
+
+    elif mode == "Gaussian Blur Blend":
+        ksize = (35, 35)
+        blurred = cv2.GaussianBlur(image_rgb, ksize, 15)
+        feathered_mask = cv2.GaussianBlur(mask.astype(np.float32) / 255.0, (15, 15), 0)[:, :, None]
+        blended = (blurred * feathered_mask + image_rgb * (1.0 - feathered_mask)).clip(0, 255).astype(np.uint8)
+        return blended
+
+    elif mode == "Pixelate":
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        res = image_rgb.copy()
+        for cnt in contours:
+            x, y, w, h = cv2.boundingRect(cnt)
+            if w <= 0 or h <= 0:
+                continue
+            roi = res[y:y+h, x:x+w]
+            sw, sh = max(1, w // 10), max(1, h // 10)
+            small = cv2.resize(roi, (sw, sh), interpolation=cv2.INTER_LINEAR)
+            pixelated = cv2.resize(small, (w, h), interpolation=cv2.INTER_NEAREST)
+            res[y:y+h, x:x+w] = pixelated
+        return res
+
+    else:
+        # Default: "Inpaint (Content-Aware Fill)" via LaMa
+        return inpainter.inpaint(image=image_rgb, mask=mask, composite=composite, is_bgr=False)
+
+
 class VideoWatermarkRemover:
     """
     Enterprise-grade sequential video watermark removal processor.
@@ -251,6 +302,8 @@ class VideoWatermarkRemover:
         video_path: Union[str, Path],
         output_path: Optional[Union[str, Path]] = None,
         mask: Optional[Union[np.ndarray, str, Path]] = None,
+        bbox: Optional[Tuple[int, int, int, int]] = None,
+        removal_mode: str = "Inpaint (Content-Aware Fill)",
         static_mask: bool = False,
         composite: bool = True,
         progress_callback: Optional[Callable[..., None]] = None,
@@ -263,8 +316,9 @@ class VideoWatermarkRemover:
         2. Clamps duration to the strict 10.0s maximum limit.
         3. Extracts frames sequentially and pipes them into temporary disk storage.
         4. For each frame:
-           a. Detects watermark via EasyOCR / SAM 2 / OpenCV (or applies supplied mask).
-           b. Inpaints watermark region via InpaintingLaMa.
+           a. Applies bounding box mask if supplied, else detects watermark via EasyOCR / SAM 2 / OpenCV.
+           b. Inpaints watermark region via selected removal mode ("Smooth Edge Interpolation",
+              "Gaussian Blur Blend", "Pixelate", or "Inpaint (Content-Aware Fill)").
            c. Writes clean RGB frame to temporary frame cache.
            d. Reports progress with elapsed time, FPS speed, and ETA.
         5. Reassembles clean frames into MP4 via MoviePy ImageSequenceClip.
@@ -275,6 +329,9 @@ class VideoWatermarkRemover:
             video_path: Source video file path.
             output_path: Destination MP4 file path (auto-generated if None).
             mask: Optional custom binary mask (numpy array or image file) applied to all frames.
+            bbox: Optional bounding box tuple (x, y, width, height) in image pixel coordinates.
+            removal_mode: Removal algorithm ("Smooth Edge Interpolation", "Gaussian Blur Blend",
+                          "Pixelate", "Inpaint (Content-Aware Fill)").
             static_mask: If True, computes watermark mask from frame 1 and reuses across all frames.
             composite: If True, preserves unmasked original pixels byte-for-byte.
             progress_callback: Callback function receiving progress updates.
@@ -323,16 +380,27 @@ class VideoWatermarkRemover:
 
             expected_frames = max(1, int(round(effective_duration * effective_fps)))
             logger.info(
-                "Processing video range: 0.0s -> %.2fs | Total Expected Frames: %d | FPS: %.2f | Audio: %s",
+                "Processing video range: 0.0s -> %.2fs | Total Expected Frames: %d | FPS: %.2f | Audio: %s | Mode: %s",
                 effective_duration,
                 expected_frames,
                 effective_fps,
                 has_audio,
+                removal_mode,
             )
 
-            # Pre-parse static mask if provided by user
+            # Pre-parse static mask or bbox if provided by user
             predefined_mask: Optional[np.ndarray] = None
-            if mask is not None:
+            if bbox is not None:
+                bx, by, bw, bh = bbox
+                predefined_mask = np.zeros((orig_height, orig_width), dtype=np.uint8)
+                x1 = max(0, min(orig_width - 1, int(bx)))
+                y1 = max(0, min(orig_height - 1, int(by)))
+                x2 = max(0, min(orig_width, int(bx + bw)))
+                y2 = max(0, min(orig_height, int(by + bh)))
+                if x2 > x1 and y2 > y1:
+                    predefined_mask[y1:y2, x1:x2] = 255
+                    logger.info("Custom bounding box mask set: [X:%d->%d, Y:%d->%d, W:%d, H:%d]", x1, x2, y1, y2, x2-x1, y2-y1)
+            elif mask is not None:
                 if isinstance(mask, (str, Path)):
                     mask_img = cv2.imread(str(mask), cv2.IMREAD_GRAYSCALE)
                     if mask_img is not None:
@@ -391,12 +459,13 @@ class VideoWatermarkRemover:
                     has_watermark = np.count_nonzero(frame_mask == 255) > 0
                     if has_watermark:
                         frames_with_watermark += 1
-                        # Neural LaMa Inpainting
-                        cleaned_rgb = self.inpainter.inpaint(
-                            image=frame_rgb,
+                        # Apply selected removal algorithm
+                        cleaned_rgb = _apply_removal_mode(
+                            image_rgb=frame_rgb,
                             mask=frame_mask,
-                            composite=composite,
-                            is_bgr=False
+                            mode=removal_mode,
+                            inpainter=self.inpainter,
+                            composite=composite
                         )
                     else:
                         cleaned_rgb = frame_rgb
