@@ -7,14 +7,14 @@ Dual-Studio Dark-Mode SaaS Platform for High-Precision Watermark Removal:
 
 Both studios feature:
 - Central Bounding-Box Canvas (gr.ImageEditor configured for box/crop selection without freehand drawing)
-- "Box Mask Tool" Control Panel with coordinate tracking (X, Y, W, H)
-- "Auto Detect" watermark scanner and "Clear" reset buttons
+- Streamlined "Box Mask Tool" Control Panel with "Auto Detect" & "Clear" controls
 - Multi-algorithm Removal Modes:
     * Inpaint (Content-Aware Fill)
     * Gaussian Blur Blend
     * Pixelate
     * Smooth Edge Interpolation
 - Vibrant Purple/Green Gradient Primary Action Buttons ("Cleanse Image" & "Cleanse Video")
+- Seamless under-the-hood bounding-box coordinate transmission to FastAPI backend
 """
 
 import os
@@ -192,14 +192,26 @@ body, .gradio-container {
   transform: translateY(-1px) !important;
 }
 
-/* === Coordinate Inputs Styling === */
-.coord-input input {
-  background: var(--bg-input) !important;
-  border: 1px solid rgba(255, 255, 255, 0.1) !important;
-  color: #38bdf8 !important;
-  font-family: 'JetBrains Mono', monospace !important;
-  font-size: 0.95rem !important;
-  border-radius: 8px !important;
+/* === Modern Removal Mode Radio Group Styling === */
+.removal-radio .wrap {
+  gap: 8px !important;
+}
+.removal-radio label {
+  background: rgba(255, 255, 255, 0.03) !important;
+  border: 1px solid rgba(255, 255, 255, 0.08) !important;
+  border-radius: 10px !important;
+  padding: 8px 14px !important;
+  transition: all 0.2s ease !important;
+  cursor: pointer !important;
+}
+.removal-radio label:hover {
+  background: rgba(139, 92, 246, 0.08) !important;
+  border-color: rgba(139, 92, 246, 0.35) !important;
+}
+.removal-radio label.selected {
+  background: rgba(139, 92, 246, 0.18) !important;
+  border-color: #8b5cf6 !important;
+  color: #ffffff !important;
 }
 
 /* === Large Primary "Cleanse" Buttons (Purple / Green Gradient) === */
@@ -808,37 +820,6 @@ def build_ui() -> gr.Blocks:
                                     scale=1
                                 )
 
-                            # Coordinates Display & Fine-tuning Inputs
-                            with gr.Row():
-                                img_x_input = gr.Number(
-                                    label="X (px)",
-                                    value=0,
-                                    precision=0,
-                                    minimum=0,
-                                    elem_classes=["coord-input"]
-                                )
-                                img_y_input = gr.Number(
-                                    label="Y (px)",
-                                    value=0,
-                                    precision=0,
-                                    minimum=0,
-                                    elem_classes=["coord-input"]
-                                )
-                                img_w_input = gr.Number(
-                                    label="Width (px)",
-                                    value=0,
-                                    precision=0,
-                                    minimum=0,
-                                    elem_classes=["coord-input"]
-                                )
-                                img_h_input = gr.Number(
-                                    label="Height (px)",
-                                    value=0,
-                                    precision=0,
-                                    minimum=0,
-                                    elem_classes=["coord-input"]
-                                )
-
                             # Removal Mode (Exact 4 options requested)
                             img_removal_mode = gr.Radio(
                                 label="Removal Mode",
@@ -850,13 +831,16 @@ def build_ui() -> gr.Blocks:
                                 ],
                                 value="Inpaint (Content-Aware Fill)",
                                 interactive=True,
+                                elem_classes=["removal-radio"]
                             )
 
-                            with gr.Accordion("⚙️ Advanced Options", open=False):
-                                img_composite_toggle = gr.Checkbox(
-                                    value=True,
-                                    label="High-Fidelity Composite (Preserve clean background pixels byte-for-byte)"
-                                )
+                            # Hidden Internal State Components (Passed under-the-hood without clutter)
+                            with gr.Row(visible=False):
+                                img_x_input = gr.Number(value=0, precision=0, visible=False)
+                                img_y_input = gr.Number(value=0, precision=0, visible=False)
+                                img_w_input = gr.Number(value=0, precision=0, visible=False)
+                                img_h_input = gr.Number(value=0, precision=0, visible=False)
+                                img_composite_toggle = gr.Checkbox(value=True, visible=False)
 
                             # Large Primary "Cleanse Image" Button (Purple/Green Gradient)
                             cleanse_image_btn = gr.Button(
@@ -976,37 +960,6 @@ def build_ui() -> gr.Blocks:
                                     scale=1
                                 )
 
-                            # Coordinates Display & Fine-tuning Inputs
-                            with gr.Row():
-                                video_x_input = gr.Number(
-                                    label="X (px)",
-                                    value=0,
-                                    precision=0,
-                                    minimum=0,
-                                    elem_classes=["coord-input"]
-                                )
-                                video_y_input = gr.Number(
-                                    label="Y (px)",
-                                    value=0,
-                                    precision=0,
-                                    minimum=0,
-                                    elem_classes=["coord-input"]
-                                )
-                                video_w_input = gr.Number(
-                                    label="Width (px)",
-                                    value=0,
-                                    precision=0,
-                                    minimum=0,
-                                    elem_classes=["coord-input"]
-                                )
-                                video_h_input = gr.Number(
-                                    label="Height (px)",
-                                    value=0,
-                                    precision=0,
-                                    minimum=0,
-                                    elem_classes=["coord-input"]
-                                )
-
                             # Removal Mode (Exact 4 options requested)
                             video_removal_mode = gr.Radio(
                                 label="Removal Mode",
@@ -1018,21 +971,17 @@ def build_ui() -> gr.Blocks:
                                 ],
                                 value="Inpaint (Content-Aware Fill)",
                                 interactive=True,
+                                elem_classes=["removal-radio"]
                             )
 
-                            # Advanced Settings Accordion
-                            with gr.Accordion("⚙️ Engine Tuning", open=False):
-                                video_composite_toggle = gr.Checkbox(
-                                    value=True,
-                                    label="High-Fidelity Composite (Preserve clean background pixels byte-for-byte)"
-                                )
-                                max_duration_slider = gr.Slider(
-                                    minimum=1.0,
-                                    maximum=10.0,
-                                    value=10.0,
-                                    step=0.5,
-                                    label="Safety Duration Ceiling (Strict 10s limit)"
-                                )
+                            # Hidden Internal State Components (Passed under-the-hood without clutter)
+                            with gr.Row(visible=False):
+                                video_x_input = gr.Number(value=0, precision=0, visible=False)
+                                video_y_input = gr.Number(value=0, precision=0, visible=False)
+                                video_w_input = gr.Number(value=0, precision=0, visible=False)
+                                video_h_input = gr.Number(value=0, precision=0, visible=False)
+                                video_composite_toggle = gr.Checkbox(value=True, visible=False)
+                                max_duration_slider = gr.Slider(minimum=1.0, maximum=10.0, value=10.0, step=0.5, visible=False)
 
                             # Large, prominent primary button with purple/green gradient style
                             cleanse_video_btn = gr.Button(
