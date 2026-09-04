@@ -21,6 +21,9 @@ easyocr>=1.7.1
 # Interactive UI & Prototyping
 gradio>=4.20.0
 
+# Video Processing Core
+moviepy>=2.0.0
+
 # Enterprise Utilities, Configuration & Logging
 python-dotenv>=1.0.1
 loguru>=0.7.2
