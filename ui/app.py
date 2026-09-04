@@ -1,18 +1,20 @@
 """
 WatermarkRemoverAI - Enterprise SaaS Studio Interface
 =====================================================
-Sleek, dark-mode SaaS platform for high-precision watermark removal.
-Features:
-- Central Bounding-Box Canvas (gr.ImageEditor configured for box/crop selection)
+Dual-Studio Dark-Mode SaaS Platform for High-Precision Watermark Removal:
+- Tab 1: "🖼️ Image Studio" - Single-image bounding-box / crop removal with multiple removal modes.
+- Tab 2: "🎬 Video Studio" - Video keyframe bounding-box removal with audio preservation.
+
+Both studios feature:
+- Central Bounding-Box Canvas (gr.ImageEditor configured for box/crop selection without freehand drawing)
 - "Box Mask Tool" Control Panel with coordinate tracking (X, Y, W, H)
-- "Auto Detect" text/logo watermark scanner and "Clear" reset buttons
+- "Auto Detect" watermark scanner and "Clear" reset buttons
 - Multi-algorithm Removal Modes:
-    * Smooth Edge Interpolation
+    * Inpaint (Content-Aware Fill)
     * Gaussian Blur Blend
     * Pixelate
-    * Inpaint (Content-Aware Fill)
-- Vibrant Purple/Green Gradient "Cleanse Video" Primary Action
-- Frame-accurate video extraction, audio synchronization, and backend API integration
+    * Smooth Edge Interpolation
+- Vibrant Purple/Green Gradient Primary Action Buttons ("Cleanse Image" & "Cleanse Video")
 """
 
 import os
@@ -23,7 +25,7 @@ import base64
 import logging
 import tempfile
 from pathlib import Path
-from typing import Optional, Tuple, Dict, Any
+from typing import Optional, Tuple, Dict, Any, List
 
 # Ensure project root directory is on sys.path
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -200,7 +202,7 @@ body, .gradio-container {
   border-radius: 8px !important;
 }
 
-/* === Large Primary "Cleanse Video" Button (Purple / Green Gradient) === */
+/* === Large Primary "Cleanse" Buttons (Purple / Green Gradient) === */
 .cleanse-btn {
   background: linear-gradient(135deg, #8b5cf6 0%, #10b981 100%) !important;
   color: #ffffff !important;
@@ -281,7 +283,7 @@ def extract_bbox_from_editor(editor_data: Any) -> Tuple[int, int, int, int]:
     """
     Extracts bounding box coordinates (x, y, width, height) from Gradio ImageEditor.
     When a user crops in ImageEditor:
-      - 'background' is the uncropped original keyframe
+      - 'background' is the uncropped original keyframe/image
       - 'composite' is the user's cropped slice
     Uses normalized cross-correlation (cv2.matchTemplate) to determine exact pixel offsets.
     Returns:
@@ -347,7 +349,169 @@ def base64_to_pil(b64_str: str) -> Optional[Image.Image]:
 
 
 # ==============================================================================
-# UI Callbacks
+# TAB 1: IMAGE STUDIO CALLBACKS
+# ==============================================================================
+
+def on_img_editor_changed(
+    editor_data: Any,
+    cur_x: int,
+    cur_y: int,
+    cur_w: int,
+    cur_h: int
+) -> Tuple[int, int, int, int, str]:
+    """Synchronizes crop changes made in the Image Studio canvas into coordinate inputs."""
+    x, y, w, h = extract_bbox_from_editor(editor_data)
+    if w > 0 and h > 0:
+        return x, y, w, h, f"📍 **Box Selected**: X: `{x}` | Y: `{y}` | Width: `{w}` | Height: `{h}`"
+    return cur_x, cur_y, cur_w, cur_h, "*Draw a box tightly over the watermark to remove it completely.*"
+
+
+def on_img_auto_detect_click(editor_data: Any) -> Tuple[int, int, int, int, Optional[Image.Image], str]:
+    """Autonomous watermark detector for Image Studio."""
+    img = None
+    if editor_data and isinstance(editor_data, dict):
+        img = editor_data.get("background") or editor_data.get("composite")
+    elif isinstance(editor_data, Image.Image):
+        img = editor_data
+
+    if img is None:
+        return 0, 0, 0, 0, None, "⚠️ **No image uploaded.** Please upload an image first."
+
+    img_rgb = np.array(img.convert("RGB"))
+    h_img, w_img = img_rgb.shape[:2]
+
+    try:
+        from api.router import get_service
+        service = get_service()
+        mask = service.detector.generate_mask(img_rgb)
+    except Exception:
+        from core.mask_generator import WatermarkDetector
+        detector = WatermarkDetector(auto_fallback=True)
+        mask = detector.generate_mask(img_rgb)
+
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if contours:
+        x, y, w, h = cv2.boundingRect(np.vstack(contours))
+        pad = 4
+        x = max(0, x - pad)
+        y = max(0, y - pad)
+        w = min(w_img - x, w + 2 * pad)
+        h = min(h_img - y, h + 2 * pad)
+
+        annotated = img_rgb.copy()
+        cv2.rectangle(annotated, (x, y), (x + w, y + h), (16, 185, 129), 3)
+        overlay = annotated.copy()
+        cv2.rectangle(overlay, (x, y), (x + w, y + h), (139, 92, 246), -1)
+        annotated = cv2.addWeighted(overlay, 0.25, annotated, 0.75, 0)
+
+        preview_pil = Image.fromarray(annotated)
+        msg = f"⚡ **Auto-Detected Watermark**: X: `{x}` | Y: `{y}` | Width: `{w}` | Height: `{h}`"
+        return x, y, w, h, preview_pil, msg
+    else:
+        return 0, 0, 0, 0, img, "ℹ️ **No watermark detected autonomously.** Please drag a box manually."
+
+
+def on_img_clear_click(editor_data: Any) -> Tuple[int, int, int, int, Optional[Image.Image], str]:
+    """Clears bounding box coordinates and resets image canvas."""
+    clean_img = None
+    if editor_data and isinstance(editor_data, dict):
+        clean_img = editor_data.get("background")
+    elif isinstance(editor_data, Image.Image):
+        clean_img = editor_data
+    return 0, 0, 0, 0, clean_img, "🧹 **Box mask cleared.** Draw a box tightly over the watermark."
+
+
+async def on_cleanse_image_click(
+    editor_data: Any,
+    x_val: float,
+    y_val: float,
+    w_val: float,
+    h_val: float,
+    removal_mode: str,
+    composite_flag: bool
+) -> Tuple[Optional[Image.Image], Optional[Image.Image], str]:
+    """
+    Sends the image and bounding box coordinates [x, y, width, height]
+    to the FastAPI /api/v1/process endpoint.
+    """
+    source_img = None
+    if editor_data and isinstance(editor_data, dict):
+        source_img = editor_data.get("background") or editor_data.get("composite")
+    elif isinstance(editor_data, Image.Image):
+        source_img = editor_data
+
+    if source_img is None:
+        return None, None, "⚠️ **No image uploaded.** Please upload an image in the left panel to proceed."
+
+    x = int(x_val or 0)
+    y = int(y_val or 0)
+    w = int(w_val or 0)
+    h = int(h_val or 0)
+
+    if w <= 0 or h <= 0:
+        bx, by, bw, bh = extract_bbox_from_editor(editor_data)
+        if bw > 0 and bh > 0:
+            x, y, w, h = bx, by, bw, bh
+
+    bbox_list = [x, y, w, h] if (w > 0 and h > 0) else None
+    img_b64 = pil_to_base64(source_img.convert("RGB"))
+
+    payload = {
+        "image_base64": img_b64,
+        "bbox": bbox_list,
+        "removal_mode": removal_mode,
+        "composite": bool(composite_flag),
+        "auto_fallback": True
+    }
+
+    target_url = LOCAL_PROCESS_ENDPOINT if "0.0.0.0" in settings.HOST else PROCESS_ENDPOINT
+
+    if HAS_HTTPX:
+        try:
+            async with httpx.AsyncClient(timeout=120.0) as client:
+                response = await client.post(target_url, json=payload)
+                if response.status_code == 200:
+                    data = response.json()
+                    cleaned_img = base64_to_pil(data.get("result_base64"))
+                    mask_img = base64_to_pil(data.get("mask_base64"))
+                    dur = data.get("duration_seconds", 0.0)
+                    jid = data.get("job_id", "N/A")
+                    bbox_str = f"`[X: {x}, Y: {y}, W: {w}, H: {h}]`" if bbox_list else "Autonomous Detection"
+                    msg = (
+                        f"✅ **Image Cleanse Completed Successfully**\n\n"
+                        f"- **Removal Mode**: `{removal_mode}`\n"
+                        f"- **Box Mask**: {bbox_str}\n"
+                        f"- **Processing Time**: `{dur}s`\n"
+                        f"- **Job UUID**: `{jid}`"
+                    )
+                    return cleaned_img, mask_img, msg
+                else:
+                    return None, None, f"❌ **API Error ({response.status_code})**: {response.text}"
+        except httpx.ConnectError:
+            logger.warning("Could not reach API via HTTP. Executing in-process fallback.")
+            from api.router import execute_watermark_removal, ProcessRequest
+            import uuid
+            req = ProcessRequest(**payload)
+            jid = str(uuid.uuid4())
+            data = execute_watermark_removal(jid, req)
+            cleaned_img = base64_to_pil(data.get("result_base64"))
+            mask_img = base64_to_pil(data.get("mask_base64"))
+            dur = data.get("duration_seconds", 0.0)
+            msg = (
+                f"✅ **Image Cleanse Completed (In-Process Fallback)**\n\n"
+                f"- **Removal Mode**: `{removal_mode}`\n"
+                f"- **Processing Time**: `{dur}s`\n"
+                f"- **Job UUID**: `{jid}`"
+            )
+            return cleaned_img, mask_img, msg
+        except Exception as exc:
+            return None, None, f"❌ **Request Error**: {str(exc)}"
+    else:
+        return None, None, "❌ **Dependency Error**: `httpx` is required for asynchronous API requests."
+
+
+# ==============================================================================
+# TAB 2: VIDEO STUDIO CALLBACKS
 # ==============================================================================
 
 def on_video_changed(video_file: Any) -> Tuple[Optional[Image.Image], int, int, int, int, str]:
@@ -373,32 +537,26 @@ def on_video_changed(video_file: Any) -> Tuple[Optional[Image.Image], int, int, 
     return None, 0, 0, 0, 0, "⚠️ Could not extract keyframe from uploaded video."
 
 
-def on_editor_changed(
+def on_video_editor_changed(
     editor_data: Any,
     cur_x: int,
     cur_y: int,
     cur_w: int,
     cur_h: int
 ) -> Tuple[int, int, int, int, str]:
-    """
-    Synchronizes crop changes made in the central ImageEditor into the coordinate inputs.
-    """
+    """Synchronizes crop changes made in the Video Studio canvas into coordinate inputs."""
     x, y, w, h = extract_bbox_from_editor(editor_data)
     if w > 0 and h > 0:
         msg = f"📍 **Box Selected**: X: `{x}` | Y: `{y}` | Width: `{w}` | Height: `{h}`"
         return x, y, w, h, msg
-    # Retain existing coordinates if no new crop is active
     return cur_x, cur_y, cur_w, cur_h, "*Draw a box tightly over the watermark to remove it completely.*"
 
 
-def on_auto_detect_click(
+def on_video_auto_detect_click(
     video_file: Any,
     editor_data: Any
 ) -> Tuple[int, int, int, int, Optional[Image.Image], str]:
-    """
-    Runs autonomous watermark detection (EasyOCR + SAM 2 / OpenCV) on the keyframe.
-    Populates bounding box coordinates (X, Y, W, H) and displays a visual preview.
-    """
+    """Runs autonomous watermark detection (EasyOCR + SAM 2 / OpenCV) on the keyframe."""
     img = None
     if editor_data and isinstance(editor_data, dict):
         img = editor_data.get("background") or editor_data.get("composite")
@@ -416,7 +574,6 @@ def on_auto_detect_click(
     img_rgb = np.array(img.convert("RGB"))
     h_img, w_img = img_rgb.shape[:2]
 
-    # Instantiate or query detector
     try:
         from api.router import get_service
         service = get_service()
@@ -429,14 +586,12 @@ def on_auto_detect_click(
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if contours:
         x, y, w, h = cv2.boundingRect(np.vstack(contours))
-        # Add slight 4px padding
         pad = 4
         x = max(0, x - pad)
         y = max(0, y - pad)
         w = min(w_img - x, w + 2 * pad)
         h = min(h_img - y, h + 2 * pad)
 
-        # Draw sleek visual bounding box preview
         annotated = img_rgb.copy()
         cv2.rectangle(annotated, (x, y), (x + w, y + h), (16, 185, 129), 3)
         overlay = annotated.copy()
@@ -450,10 +605,8 @@ def on_auto_detect_click(
         return 0, 0, 0, 0, img, "ℹ️ **No watermark detected autonomously.** Please drag a box manually."
 
 
-def on_clear_click(video_file: Any) -> Tuple[int, int, int, int, Optional[Image.Image], str]:
-    """
-    Clears all bounding box coordinates and reloads the clean keyframe.
-    """
+def on_video_clear_click(video_file: Any) -> Tuple[int, int, int, int, Optional[Image.Image], str]:
+    """Clears all bounding box coordinates and reloads the clean keyframe."""
     clean_img = None
     if video_file:
         vpath = extract_video_path(video_file)
@@ -485,7 +638,6 @@ async def on_cleanse_video_click(
     if not source_path.name.lower().endswith(".mp4"):
         return None, f"❌ **Unsupported format**: '{source_path.name}'. Only `.mp4` video files are supported."
 
-    # Determine coordinates (check numeric inputs first, fallback to editor crop)
     x = int(x_val or 0)
     y = int(y_val or 0)
     w = int(w_val or 0)
@@ -588,12 +740,9 @@ async def on_cleanse_video_click(
 
 def build_ui() -> gr.Blocks:
     """
-    Builds the sleek, dark-mode SaaS Gradio Blocks interface with:
-    1. Large central gr.ImageEditor configured for bounding-box/crop selection.
-    2. Control panel titled "Box Mask Tool" with subtitle.
-    3. Small "Auto Detect" and "Clear" buttons.
-    4. "Removal Mode" radio with the 4 exact options.
-    5. Primary "Cleanse Video" button with purple/green gradient style.
+    Builds the sleek, dark-mode SaaS Gradio Blocks interface featuring a dual-tab layout:
+    Tab 1: 🖼️ Image Studio
+    Tab 2: 🎬 Video Studio
     """
     with gr.Blocks(title="WatermarkRemoverAI Studio", theme=gr.themes.Monochrome()) as demo:
         # Injected Custom CSS for dark-mode SaaS styling
@@ -607,14 +756,175 @@ def build_ui() -> gr.Blocks:
                     <div style="text-align: center;">
                         <div class="brand-pill">🛡️ PRO ENTERPRISE · STUDIO EDITION</div>
                         <h1 class="saas-title">WatermarkRemover<span style="color: #8b5cf6;">AI</span></h1>
-                        <p class="saas-subtitle">Next-Generation Neural Video & Image Watermark Reconstruction</p>
+                        <p class="saas-subtitle">Precision Multi-Modal Neural Watermark Removal Platform</p>
                     </div>
                     """
                 )
 
-        with gr.Tabs():
+        with gr.Tabs(elem_classes=["main-tabs"]):
             # ==================================================================
-            # TAB 1: VIDEO WATERMARK REMOVER (Flagship SaaS Studio)
+            # TAB 1: IMAGE STUDIO
+            # ==================================================================
+            with gr.Tab("🖼️ Image Studio", id="tab_image_studio"):
+                with gr.Row():
+                    # Left Column: Image Canvas & Box Mask Tool
+                    with gr.Column(scale=7):
+                        with gr.Group(elem_classes=["saas-card"]):
+                            gr.Markdown("### 1. Source Image & Bounding-Box Selector")
+                            img_editor = gr.ImageEditor(
+                                label="Input Image Canvas (Crop tool: Drag a tight box over watermark)",
+                                type="pil",
+                                brush=False,
+                                eraser=False,
+                                layers=False,
+                                transforms=["crop"],
+                                sources=["upload", "clipboard"],
+                                elem_classes=["central-canvas-card"]
+                            )
+
+                        # Control Panel: "Box Mask Tool"
+                        with gr.Group(elem_classes=["box-mask-panel"]):
+                            gr.HTML(
+                                """
+                                <div class="panel-header">
+                                    <h3 class="panel-title">Box Mask Tool</h3>
+                                    <p class="panel-subtitle">Draw a box tightly over the watermark to remove it completely.</p>
+                                </div>
+                                """
+                            )
+
+                            # Two Small Buttons: "Auto Detect" and "Clear"
+                            with gr.Row():
+                                img_auto_detect_btn = gr.Button(
+                                    "⚡ Auto Detect",
+                                    size="sm",
+                                    elem_classes=["btn-auto-detect"],
+                                    scale=1
+                                )
+                                img_clear_btn = gr.Button(
+                                    "🗑️ Clear",
+                                    size="sm",
+                                    elem_classes=["btn-clear"],
+                                    scale=1
+                                )
+
+                            # Coordinates Display & Fine-tuning Inputs
+                            with gr.Row():
+                                img_x_input = gr.Number(
+                                    label="X (px)",
+                                    value=0,
+                                    precision=0,
+                                    minimum=0,
+                                    elem_classes=["coord-input"]
+                                )
+                                img_y_input = gr.Number(
+                                    label="Y (px)",
+                                    value=0,
+                                    precision=0,
+                                    minimum=0,
+                                    elem_classes=["coord-input"]
+                                )
+                                img_w_input = gr.Number(
+                                    label="Width (px)",
+                                    value=0,
+                                    precision=0,
+                                    minimum=0,
+                                    elem_classes=["coord-input"]
+                                )
+                                img_h_input = gr.Number(
+                                    label="Height (px)",
+                                    value=0,
+                                    precision=0,
+                                    minimum=0,
+                                    elem_classes=["coord-input"]
+                                )
+
+                            # Removal Mode (Exact 4 options requested)
+                            img_removal_mode = gr.Radio(
+                                label="Removal Mode",
+                                choices=[
+                                    "Smooth Edge Interpolation",
+                                    "Gaussian Blur Blend",
+                                    "Pixelate",
+                                    "Inpaint (Content-Aware Fill)"
+                                ],
+                                value="Inpaint (Content-Aware Fill)",
+                                interactive=True,
+                            )
+
+                            with gr.Accordion("⚙️ Advanced Options", open=False):
+                                img_composite_toggle = gr.Checkbox(
+                                    value=True,
+                                    label="High-Fidelity Composite (Preserve clean background pixels byte-for-byte)"
+                                )
+
+                            # Large Primary "Cleanse Image" Button (Purple/Green Gradient)
+                            cleanse_image_btn = gr.Button(
+                                "✨ Cleanse Image",
+                                size="lg",
+                                elem_classes=["cleanse-btn"]
+                            )
+
+                    # Right Column: Image Output & Mask Verification
+                    with gr.Column(scale=5):
+                        with gr.Group(elem_classes=["saas-card"]):
+                            gr.Markdown("### 2. Cleaned Image Verification")
+                            with gr.Tabs():
+                                with gr.TabItem("✨ Cleaned Output"):
+                                    img_output = gr.Image(
+                                        label="Cleaned Image Output",
+                                        type="pil",
+                                        interactive=False
+                                    )
+                                with gr.TabItem("🎭 Generated Box Mask"):
+                                    img_mask_output = gr.Image(
+                                        label="Binary Watermark Mask (White = Cleaned)",
+                                        type="pil",
+                                        interactive=False
+                                    )
+
+                            img_status_card = gr.Markdown(
+                                value="*Awaiting image cleanse... Upload an image, drag a box over watermark, and click 'Cleanse Image'.*",
+                                elem_classes=["status-card"]
+                            )
+
+                # --------------------------------------------------------------
+                # Event Bindings for Image Studio
+                # --------------------------------------------------------------
+                img_editor.change(
+                    fn=on_img_editor_changed,
+                    inputs=[img_editor, img_x_input, img_y_input, img_w_input, img_h_input],
+                    outputs=[img_x_input, img_y_input, img_w_input, img_h_input, img_status_card]
+                )
+
+                img_auto_detect_btn.click(
+                    fn=on_img_auto_detect_click,
+                    inputs=[img_editor],
+                    outputs=[img_x_input, img_y_input, img_w_input, img_h_input, img_editor, img_status_card]
+                )
+
+                img_clear_btn.click(
+                    fn=on_img_clear_click,
+                    inputs=[img_editor],
+                    outputs=[img_x_input, img_y_input, img_w_input, img_h_input, img_editor, img_status_card]
+                )
+
+                cleanse_image_btn.click(
+                    fn=on_cleanse_image_click,
+                    inputs=[
+                        img_editor,
+                        img_x_input,
+                        img_y_input,
+                        img_w_input,
+                        img_h_input,
+                        img_removal_mode,
+                        img_composite_toggle
+                    ],
+                    outputs=[img_output, img_mask_output, img_status_card]
+                )
+
+            # ==================================================================
+            # TAB 2: VIDEO STUDIO
             # ==================================================================
             with gr.Tab("🎬 Video Studio", id="tab_video_studio"):
                 with gr.Row():
@@ -629,7 +939,7 @@ def build_ui() -> gr.Blocks:
                             )
 
                             # Central ImageEditor configured specifically for bounding-box / crop selection
-                            image_editor = gr.ImageEditor(
+                            video_editor = gr.ImageEditor(
                                 label="Keyframe Canvas (Crop tool: Drag a tight box over watermark)",
                                 type="pil",
                                 brush=False,
@@ -653,13 +963,13 @@ def build_ui() -> gr.Blocks:
 
                             # Two Small Buttons: "Auto Detect" and "Clear"
                             with gr.Row():
-                                auto_detect_btn = gr.Button(
+                                video_auto_detect_btn = gr.Button(
                                     "⚡ Auto Detect",
                                     size="sm",
                                     elem_classes=["btn-auto-detect"],
                                     scale=1
                                 )
-                                clear_btn = gr.Button(
+                                video_clear_btn = gr.Button(
                                     "🗑️ Clear",
                                     size="sm",
                                     elem_classes=["btn-clear"],
@@ -668,28 +978,28 @@ def build_ui() -> gr.Blocks:
 
                             # Coordinates Display & Fine-tuning Inputs
                             with gr.Row():
-                                x_input = gr.Number(
+                                video_x_input = gr.Number(
                                     label="X (px)",
                                     value=0,
                                     precision=0,
                                     minimum=0,
                                     elem_classes=["coord-input"]
                                 )
-                                y_input = gr.Number(
+                                video_y_input = gr.Number(
                                     label="Y (px)",
                                     value=0,
                                     precision=0,
                                     minimum=0,
                                     elem_classes=["coord-input"]
                                 )
-                                w_input = gr.Number(
+                                video_w_input = gr.Number(
                                     label="Width (px)",
                                     value=0,
                                     precision=0,
                                     minimum=0,
                                     elem_classes=["coord-input"]
                                 )
-                                h_input = gr.Number(
+                                video_h_input = gr.Number(
                                     label="Height (px)",
                                     value=0,
                                     precision=0,
@@ -698,7 +1008,7 @@ def build_ui() -> gr.Blocks:
                                 )
 
                             # Removal Mode (Exact 4 options requested)
-                            removal_mode = gr.Radio(
+                            video_removal_mode = gr.Radio(
                                 label="Removal Mode",
                                 choices=[
                                     "Smooth Edge Interpolation",
@@ -712,7 +1022,7 @@ def build_ui() -> gr.Blocks:
 
                             # Advanced Settings Accordion
                             with gr.Accordion("⚙️ Engine Tuning", open=False):
-                                composite_toggle = gr.Checkbox(
+                                video_composite_toggle = gr.Checkbox(
                                     value=True,
                                     label="High-Fidelity Composite (Preserve clean background pixels byte-for-byte)"
                                 )
@@ -741,7 +1051,7 @@ def build_ui() -> gr.Blocks:
                                 autoplay=False
                             )
 
-                            status_card = gr.Markdown(
+                            video_status_card = gr.Markdown(
                                 value="*Awaiting video cleanse... Upload an MP4 video, drag a box over watermark, and click 'Cleanse Video'.*",
                                 elem_classes=["status-card"]
                             )
@@ -749,32 +1059,32 @@ def build_ui() -> gr.Blocks:
                 # --------------------------------------------------------------
                 # Event Bindings for Video Studio
                 # --------------------------------------------------------------
-                # When video is uploaded, extract keyframe 0 into ImageEditor
+                # When video is uploaded, extract keyframe 0 into Video ImageEditor
                 video_input.change(
                     fn=on_video_changed,
                     inputs=[video_input],
-                    outputs=[image_editor, x_input, y_input, w_input, h_input, status_card]
+                    outputs=[video_editor, video_x_input, video_y_input, video_w_input, video_h_input, video_status_card]
                 )
 
-                # When user crops in ImageEditor, synchronize coordinates
-                image_editor.change(
-                    fn=on_editor_changed,
-                    inputs=[image_editor, x_input, y_input, w_input, h_input],
-                    outputs=[x_input, y_input, w_input, h_input, status_card]
+                # When user crops in Video ImageEditor, synchronize coordinates
+                video_editor.change(
+                    fn=on_video_editor_changed,
+                    inputs=[video_editor, video_x_input, video_y_input, video_w_input, video_h_input],
+                    outputs=[video_x_input, video_y_input, video_w_input, video_h_input, video_status_card]
                 )
 
                 # When user clicks "Auto Detect"
-                auto_detect_btn.click(
-                    fn=on_auto_detect_click,
-                    inputs=[video_input, image_editor],
-                    outputs=[x_input, y_input, w_input, h_input, image_editor, status_card]
+                video_auto_detect_btn.click(
+                    fn=on_video_auto_detect_click,
+                    inputs=[video_input, video_editor],
+                    outputs=[video_x_input, video_y_input, video_w_input, video_h_input, video_editor, video_status_card]
                 )
 
                 # When user clicks "Clear"
-                clear_btn.click(
-                    fn=on_clear_click,
+                video_clear_btn.click(
+                    fn=on_video_clear_click,
                     inputs=[video_input],
-                    outputs=[x_input, y_input, w_input, h_input, image_editor, status_card]
+                    outputs=[video_x_input, video_y_input, video_w_input, video_h_input, video_editor, video_status_card]
                 )
 
                 # When user clicks "Cleanse Video"
@@ -782,16 +1092,16 @@ def build_ui() -> gr.Blocks:
                     fn=on_cleanse_video_click,
                     inputs=[
                         video_input,
-                        image_editor,
-                        x_input,
-                        y_input,
-                        w_input,
-                        h_input,
-                        removal_mode,
-                        composite_toggle,
+                        video_editor,
+                        video_x_input,
+                        video_y_input,
+                        video_w_input,
+                        video_h_input,
+                        video_removal_mode,
+                        video_composite_toggle,
                         max_duration_slider
                     ],
-                    outputs=[video_output, status_card]
+                    outputs=[video_output, video_status_card]
                 )
 
     return demo
