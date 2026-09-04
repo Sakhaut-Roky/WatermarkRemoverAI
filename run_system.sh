@@ -94,8 +94,8 @@ echo "[1/2] Starting FastAPI Core Platform (0.0.0.0:8000)..."
 python -m uvicorn main:app --host 0.0.0.0 --port 8000 --log-level info &
 FASTAPI_PID=$!
 
-# Brief pause to allow FastAPI startup
-sleep 3
+# Brief pause to allow FastAPI startup and model warmup
+sleep 6
 
 # Start Service B: Standalone Gradio QA Console (Port 7860)
 echo "[2/2] Starting Standalone Gradio QA Console (127.0.0.1:7860)..."
